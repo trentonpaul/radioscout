@@ -1,117 +1,192 @@
-import whisper
+import json
+import logging
+import os
+import shutil
+import sys
+import time
+import concurrent.futures
+
 import ffmpeg
 import numpy as np
 import torch
-import time
-import concurrent.futures
-from telegram_bot import send_message
+import whisper
 from dotenv import load_dotenv
-import os
-import json
+from telegram_bot import send_message
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+
+def load_config():
+    stream_url = os.getenv("RADIO_URL")
+    if not stream_url:
+        raise ValueError("RADIO_URL environment variable is required.")
+
+    raw_phrases = os.getenv("TARGET_PHRASES")
+    if not raw_phrases:
+        raise ValueError("TARGET_PHRASES environment variable is required.")
+
+    try:
+        key_phrases = json.loads(raw_phrases)
+    except json.JSONDecodeError as exc:
+        raise ValueError("TARGET_PHRASES must be valid JSON.") from exc
+
+    if not isinstance(key_phrases, list) or not all(isinstance(p, str) for p in key_phrases):
+        raise ValueError("TARGET_PHRASES must be a JSON array of strings.")
+
+    return stream_url, key_phrases
+
+
+def ensure_ffmpeg_available():
+    if shutil.which("ffmpeg") is None:
+        raise EnvironmentError("ffmpeg is not installed or not available on PATH.")
+
+
 class RadioStreamTranscriber:
-    def __init__(self, stream_url, key_phrases):
+    def __init__(self, stream_url, key_phrases, model_name="tiny.en"):
         self.stream_url = stream_url
-        self.key_phrases = key_phrases
-        self.model = whisper.load_model("tiny.en")
-        # Configuration constants
+        self.key_phrases = [phrase.lower() for phrase in key_phrases]
+        self.model_name = model_name
+        self.model = self._load_model()
         self.seconds_per_chunk = 10
         self.overlap_seconds = 2
         self.sample_rate = 16000
-        self.samples_per_chunk = self.sample_rate * self.seconds_per_chunk
         self.samples_overlap = self.sample_rate * self.overlap_seconds
+        self.process = None
+        self.retry_delay = 1
+        self.retry_limit = 5
+
+    def _load_model(self):
+        try:
+            logger.info("Loading Whisper model: %s", self.model_name)
+            return whisper.load_model(self.model_name)
+        except Exception as exc:
+            logger.exception("Failed to load Whisper model")
+            raise RuntimeError("Unable to initialize speech model.") from exc
 
     def on_phrase_detected(self, phrase, full_text):
-        send_message(f"📻 The Mix ALERT: CALL (312-233-1019). '{phrase}' found inside this text: {full_text}")
-        print(f"📻 The Mix ALERT: CALL (312-233-1019). '{phrase}' found inside this text: {full_text}")
-        # send_message(f"🔥 DETECTED: '{phrase}' inside: {full_text}")
-        # print(f"🔥 DETECTED: '{phrase}' inside: {full_text}")
+        message = f"📻 The Mix ALERT: CALL (312-233-1019). '{phrase}' found inside this text: {full_text}"
+        try:
+            send_message(message)
+        except Exception:
+            logger.exception("Failed to send Telegram alert for phrase '%s'", phrase)
+        logger.info(message)
 
     def get_radio_stream(self, url):
-        process = (
-            ffmpeg
-            .input(url)
-            .output('pipe:', format='wav', acodec='pcm_s16le', ac=1, ar='16000')
-            .run_async(pipe_stdout=True, pipe_stderr=True)
-        )
-        return process
+        try:
+            logger.info("Starting ffmpeg stream for URL: %s", url)
+            process = (
+                ffmpeg
+                .input(url)
+                .output("pipe:", format="wav", acodec="pcm_s16le", ac=1, ar=self.sample_rate)
+                .run_async(pipe_stdout=True, pipe_stderr=True)
+            )
+            return process
+        except ffmpeg.Error as exc:
+            logger.exception("Failed to start ffmpeg process")
+            return None
 
     def convert_audio_to_numpy(self, audio_bytes):
-        audio = np.frombuffer(audio_bytes, dtype=np.int16)
-        audio = audio.astype(np.float32) / 32768.0
-        return torch.from_numpy(audio)
+        try:
+            audio = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio = audio.astype(np.float32) / 32768.0
+            return torch.from_numpy(audio)
+        except Exception:
+            logger.exception("Failed to convert audio bytes to numpy tensor")
+            raise
 
     def safe_transcribe(self, audio_tensor, timeout=20):
-        # Safely transcribe audio with a timeout to prevent getting stuck.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.model.transcribe, audio_tensor)
             try:
-                result = future.result(timeout=timeout)
-                return result
+                return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                print("⚠️ Transcription timeout. Skipping this chunk...")
+                logger.warning("Transcription timeout. Skipping this chunk.")
                 return None
+            except Exception:
+                logger.exception("Unexpected error during transcription")
+                return None
+
+    def restart_stream(self):
+        self.close_process()
+        for attempt in range(1, self.retry_limit + 1):
+            logger.info("Attempt %d/%d to restart stream", attempt, self.retry_limit)
+            self.process = self.get_radio_stream(self.stream_url)
+            if self.process is not None:
+                self.retry_delay = 1
+                return True
+            time.sleep(self.retry_delay)
+            self.retry_delay = min(self.retry_delay * 2, 30)
+        return False
+
+    def close_process(self):
+        if self.process is None:
+            return
+        try:
+            if self.process.poll() is None:
+                self.process.kill()
+                logger.info("Killed existing ffmpeg process")
+        except Exception:
+            logger.exception("Error while killing ffmpeg process")
+        finally:
+            self.process = None
 
     def transcribe_radio_stream(self):
         previous_audio = torch.tensor([])
+        self.process = self.get_radio_stream(self.stream_url)
 
-        process = self.get_radio_stream(self.stream_url)
+        if self.process is None:
+            raise RuntimeError("Unable to open radio stream.")
 
         try:
             while True:
-                # Read audio chunk
-                print("⏳ Reading audio chunk...")
-                audio_chunk = process.stdout.read(self.sample_rate * 2 * self.seconds_per_chunk)
+                logger.debug("Reading audio chunk")
+                expected_bytes = self.sample_rate * 2 * self.seconds_per_chunk
+                audio_chunk = self.process.stdout.read(expected_bytes)
 
-                if not audio_chunk or len(audio_chunk) < self.sample_rate * 2 * self.seconds_per_chunk:
-                    print("⚠️ Stream hiccup detected. Restarting ffmpeg...")
-                    process.kill()
-                    time.sleep(1)
-                    process = self.get_radio_stream(self.stream_url)
+                if not audio_chunk or len(audio_chunk) < expected_bytes:
+                    logger.warning("Stream hiccup detected; restarting ffmpeg")
+                    if not self.restart_stream():
+                        raise RuntimeError("Unable to restart ffmpeg after repeated failures.")
+                    previous_audio = torch.tensor([])
                     continue
 
                 current_audio = self.convert_audio_to_numpy(audio_chunk)
-
-                # Concatenate previous overlap with current audio
                 combined_audio = torch.cat((previous_audio, current_audio), dim=0)
 
-                print("🔊 Processing audio chunk...")
-
+                logger.info("Transcribing audio chunk")
                 result = self.safe_transcribe(combined_audio)
-
                 if result is None:
-                    # Skip this chunk if transcription failed
                     continue
 
-                text = result['text'].lower()
+                text = result.get("text", "").lower()
+                logger.info("Transcription result: %s", text)
 
-                print("📝", text)
-
-                print("🔍 Searching for key phrases...")
-                # Detect key phrases
+                logger.debug("Scanning for key phrases")
                 for phrase in self.key_phrases:
-                    if phrase.lower() in text:
+                    if phrase in text:
                         self.on_phrase_detected(phrase, text)
 
-                # Save last N seconds for next overlap
-                if len(current_audio) >= self.samples_overlap:
-                    previous_audio = current_audio[-self.samples_overlap:]
-                else:
-                    previous_audio = current_audio
-
+                previous_audio = current_audio[-self.samples_overlap:] if len(current_audio) >= self.samples_overlap else current_audio
                 time.sleep(0.2)
 
         except KeyboardInterrupt:
-            print("Stopping...")
+            logger.info("Keyboard interrupt received; stopping")
+        except Exception:
+            logger.exception("Unexpected failure in transcription loop")
+            raise
         finally:
-            process.kill()
+            self.close_process()
 
-# Load configuration
-stream_url = os.getenv("RADIO_URL")
-key_phrases = json.loads(os.getenv("TARGET_PHRASES"))
 
-# Instantiate and run
-transcriber = RadioStreamTranscriber(stream_url, key_phrases)
-transcriber.transcribe_radio_stream()
+if __name__ == "__main__":
+    ensure_ffmpeg_available()
+    stream_url, key_phrases = load_config()
+    transcriber = RadioStreamTranscriber(stream_url, key_phrases)
+    transcriber.transcribe_radio_stream()
