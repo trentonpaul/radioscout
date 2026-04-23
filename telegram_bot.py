@@ -15,7 +15,7 @@ async def send_notification(message, retries=5, base_delay=1):
     bot = Bot(token=bot_token)
     for attempt in range(retries):
         try:
-            await bot.send_message(chat_id=chat_id, text=message)
+            await bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
             break  # Success (exit the loop)
         except TimedOut:
             wait_time = base_delay * (2 ** attempt)  # Exponential backoff

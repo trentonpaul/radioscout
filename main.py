@@ -40,7 +40,13 @@ def load_config():
     if not isinstance(key_phrases, list) or not all(isinstance(p, str) for p in key_phrases):
         raise ValueError("TARGET_PHRASES must be a JSON array of strings.")
 
-    return stream_url, key_phrases
+    message_template = os.getenv(
+        "MESSAGE_TEMPLATE"
+    )
+    # Decode escape sequences like \n, \r, \t
+    message_template = message_template.encode('utf-8').decode('unicode_escape')
+
+    return stream_url, key_phrases, message_template
 
 
 def ensure_ffmpeg_available():
@@ -49,9 +55,10 @@ def ensure_ffmpeg_available():
 
 
 class RadioStreamTranscriber:
-    def __init__(self, stream_url, key_phrases, model_name="tiny.en"):
+    def __init__(self, stream_url, key_phrases, message_template, model_name="tiny.en"):
         self.stream_url = stream_url
         self.key_phrases = [phrase.lower() for phrase in key_phrases]
+        self.message_template = message_template
         self.model_name = model_name
         self.model = self._load_model()
         self.seconds_per_chunk = 10
@@ -71,7 +78,7 @@ class RadioStreamTranscriber:
             raise RuntimeError("Unable to initialize speech model.") from exc
 
     def on_phrase_detected(self, phrase, full_text):
-        message = f"📻 The Mix ALERT: CALL (312-233-1019). '{phrase}' found inside this text: {full_text}"
+        message = self.message_template.format(phrase=phrase, text=full_text)
         try:
             send_message(message)
         except Exception:
@@ -187,6 +194,6 @@ class RadioStreamTranscriber:
 
 if __name__ == "__main__":
     ensure_ffmpeg_available()
-    stream_url, key_phrases = load_config()
-    transcriber = RadioStreamTranscriber(stream_url, key_phrases)
+    stream_url, key_phrases, message_template = load_config()
+    transcriber = RadioStreamTranscriber(stream_url, key_phrases, message_template)
     transcriber.transcribe_radio_stream()
